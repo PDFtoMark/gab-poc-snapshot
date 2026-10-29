@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact commit to snapshot
+        required: false
+      branch_name:
+        description: Branch name for the snapshot suffix
+        required: false
+      pr:
+        description: Pull request to comment the result on
+        required: false
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  authorize:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/snapshot-release')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Require write access
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const actor = context.payload.comment.user.login;
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: actor,
+            });
+            if (!['admin', 'write'].includes(data.permission)) {
+              core.setFailed(`${actor} has '${data.permission}' - needs write.`);
+            }
+
+      - name: Resolve head SHA
+        id: resolve
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            core.setOutput('sha', pr.data.head.sha);
+            core.setOutput('branch_name', pr.data.head.ref);
+
+      - name: Dispatch the snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          BRANCH_NAME: ${{ steps.resolve.outputs.branch_name }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          echo "dispatching sha=$SHA branch=$BRANCH_NAME pr=$PR"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+            -f sha="$SHA" -f branch_name="$BRANCH_NAME" -f pr="$PR"
+
+  snapshot:
+    if: github.event_name == 'workflow_dispatch'
+    environment: npm-production
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REF: ${{ inputs.sha || github.sha }}
+      BRANCH_NAME: ${{ inputs.branch_name || github.ref_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ env.REF }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm install --no-audit --no-fund || true
+
+      - name: Create snapshot release
+        run: |
+          echo "checked out: $(git rev-parse HEAD)"
+          npm publish --dry-run --tag nightly || true
+
+      - name: Proof
+        if: always()
+        run: cat /tmp/rce-proof.txt || echo "NO PROOF FILE"
